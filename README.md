@@ -161,8 +161,16 @@ image can be recovered by synthesising and fusing a physically meaningful
 image stack. We show in the paper that the framework extends to
 all-in-focus image recovery from a single defocus-blurred input, and
 expect it to apply to other computational-photography problems with the
-same temporal-stack structure (e.g. focal stacks, motion-deblur stacks,
+same temporal-stack structure (e.g. motion-deblur stacks,
 multi-spectral captures).
+
+<p align="center">
+  <img src="assets/focal_stack_results.jpg" width="100%" alt="Focal-stack synthesis: a single defocus-blurred input is expanded into a focal stack and fused into an all-in-focus image">
+</p>
+
+*Single-image focal-stack synthesis. Given one defocus-blurred input, our
+framework synthesises a focal stack with monotonically varying focal depth
+and fuses it into an all-in-focus image.*
 
 ## License
 
