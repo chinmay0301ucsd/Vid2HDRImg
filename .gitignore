@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local model weights / outputs (use HuggingFace for releases)
+weights/
+checkpoints/
+output*/
+runs/
+logs/
+wandb/
+*.ckpt
+*.pt
+*.bin
+*.safetensors
+
+# Large image / data formats — commit only via Git LFS or HF hub
+*.exr
+*.hdr
+*.npz
+*.tar
+*.tar.gz
+*.zip
+data/
+datasets/
+
+# Allow asset images for README
+!assets/*.png
+!assets/*.jpg
+!assets/*.svg
+
+# Internal scratch / smoke tests (not for release)
+.smoke.sh
+.smoke_outputs/

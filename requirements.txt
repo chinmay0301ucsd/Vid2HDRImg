@@ -1,0 +1,21 @@
+# NOTE: install PyTorch first, matched to your GPU stack — see docs/INSTALL_*.md.
+# These pins are PyTorch-version agnostic.
+
+diffusers==0.27.2          # exact pin: matches what the model was trained with
+transformers>=4.40
+accelerate>=1.0
+peft>=0.10
+einops>=0.8
+numpy>=1.26,<2
+opencv-python>=4.8
+pillow>=10
+HDRutils>=1.2
+OpenEXR>=3.4
+pyexr>=0.5
+huggingface-hub>=0.20      # for downloading checkpoints
+
+# Optional — only used during training (Stage 1 & 2)
+matplotlib>=3.7
+pyiqa>=0.1.10
+scikit-image>=0.21
+wandb>=0.16
