@@ -172,13 +172,3 @@ Stability AI's licence terms; see the
 [SVD model card](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid)
 for details.
 
-## Citation
-
-```bibtex
-@inproceedings{talegaonkar2026vid2hdrimg,
-  title     = {Single-shot HDR via Conditional Video Generation},
-  author    = {Talegaonkar, Chinmay and others},
-  booktitle = {NeurIPS},
-  year      = {2026}
-}
-```
