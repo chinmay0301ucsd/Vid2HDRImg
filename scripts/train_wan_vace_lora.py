@@ -55,7 +55,7 @@ from peft.utils import get_peft_model_state_dict as _peft_state
 
 # Local dataset (must be importable from the Vid2HDRImg/scripts/ path)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.dataset_hdr import RawHDRPairDataset
+from src.dataset_hdr import RawHDRPairDataset, hdr_to_ldr_batch_np, read_hdr_image_float32
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,15 @@ def parse_args():
                    help="Strongly recommended for 14B model + LoRA.")
     p.add_argument("--checkpointing_steps", type=int, default=1000)
     p.add_argument("--logging_steps",        type=int, default=10)
+    p.add_argument("--validation_steps",     type=int, default=500,
+                   help="Run a quick few-step denoising on a fixed val sample every N steps; "
+                        "save PNGs and log per-frame std + PSNR/SSIM vs GT to wandb. 0 to disable.")
+    p.add_argument("--num_validation_inference_steps", type=int, default=10,
+                   help="Number of denoising steps for the periodic validation render.")
+    p.add_argument("--num_validation_samples", type=int, default=1,
+                   help="How many noise seeds to render per val step (each seed = one strip).")
+    p.add_argument("--validation_sample_index", type=int, default=0,
+                   help="Dataset index of the fixed val sample (held constant across all val renders).")
     p.add_argument("--report_to",            default="tensorboard",
                    choices=["tensorboard", "wandb", "all", "none"])
     p.add_argument("--use_noisy_samples",    action="store_true", default=True,
@@ -148,6 +157,87 @@ def wan_vae_denormalize(latents: torch.Tensor, mean: torch.Tensor, std_inv: torc
     return latents.float() / std_inv + mean
 
 
+def compute_metrics(gen_frames_uint8: "np.ndarray", gt_frames_uint8: "np.ndarray") -> dict:
+    """Per-frame PSNR + SSIM between two (T, H, W, 3) uint8 arrays.  Returns
+    per-frame lists + means.  PSNR computed pixel-wise on [0, 255]; SSIM via
+    skimage.metrics.structural_similarity (channel-wise, win=11)."""
+    import numpy as np
+    from skimage.metrics import structural_similarity as ssim_fn
+    assert gen_frames_uint8.shape == gt_frames_uint8.shape, \
+        f"shape mismatch {gen_frames_uint8.shape} vs {gt_frames_uint8.shape}"
+    T = gen_frames_uint8.shape[0]
+    psnrs, ssims = [], []
+    for i in range(T):
+        g = gen_frames_uint8[i].astype(np.float32)
+        t = gt_frames_uint8[i].astype(np.float32)
+        mse = ((g - t) ** 2).mean()
+        psnrs.append(99.0 if mse == 0 else 10.0 * np.log10(255.0 * 255.0 / mse))
+        ssims.append(float(ssim_fn(g, t, channel_axis=-1, data_range=255.0)))
+    return {
+        "psnr_per_frame": psnrs,
+        "ssim_per_frame": ssims,
+        "psnr_mean":      float(np.mean(psnrs)),
+        "ssim_mean":      float(np.mean(ssims)),
+    }
+
+
+@torch.no_grad()
+def render_validation(transformer, vae, scheduler, text_embed,
+                      ref_frame_thwc: torch.Tensor,
+                      latents_mean, latents_std_inv, inactive_zero_latent,
+                      num_inference_steps: int, resolution: int,
+                      device, dtype, noise_seed: int = 0) -> "np.ndarray":
+    """Run a short denoising loop on one held-out reference image to visualise
+    what the model currently generates.  Returns a (T, H, W, 3) uint8 array.
+
+    Mirrors the training-time forward path (same conditioning, same VACE control
+    convention with reactive=zeros).  Uses the pipeline's scheduler.step() so
+    flow-matching is applied correctly.
+    """
+    import numpy as np
+    transformer.eval()
+    try:
+        # 1. Encode the reference frame.
+        ref_video = ref_frame_thwc.permute(2, 0, 1).unsqueeze(0).unsqueeze(2).to(device, dtype=dtype)  # (1, 3, 1, H, W)
+        ref_latent = encode_video_with_wan_vae(vae, ref_video, latents_mean, latents_std_inv)         # (1, 16, 1, H', W')
+
+        # 2. Init noise (pure noise as the "video" we're denoising). T_lat = inactive_zero_latent.shape[2].
+        # Deterministic seed so renders are comparable across val steps — only the LoRA weights change.
+        T_lat = inactive_zero_latent.shape[2]
+        z_shape = (1, vae.config.z_dim, T_lat + 1, ref_latent.shape[-2], ref_latent.shape[-1])
+        gen = torch.Generator(device="cpu").manual_seed(noise_seed)
+        noisy_hidden = torch.randn(z_shape, generator=gen).to(device=device, dtype=dtype)
+
+        # 3. Build control (matches training: reactive=inactive=vae(zeros)).
+        zeros_target = inactive_zero_latent.to(dtype)                                                  # (1, 16, T_lat, H', W')
+        control_hs   = build_vace_control(zeros_target, ref_latent, inactive_zero_latent)              # (1, 96, T_lat+1, H', W')
+
+        # 4. Denoising loop.
+        scheduler.set_timesteps(num_inference_steps, device=device)
+        text_embed_1 = text_embed[:1]                                                                  # (1, L, 4096)
+        # Build added_time_ids — Wan transformer doesn't use them directly for this model but
+        # forward(...) doesn't require them anyway when not provided (default None).
+        for t in scheduler.timesteps:
+            model_out = transformer(
+                hidden_states=noisy_hidden,
+                timestep=t.expand(1),
+                encoder_hidden_states=text_embed_1,
+                control_hidden_states=control_hs,
+                return_dict=False,
+            )[0]
+            noisy_hidden = scheduler.step(model_out, t, noisy_hidden, return_dict=False)[0]
+
+        # 5. Drop the reference frame (time index 0) and decode the rest.
+        final_latents = noisy_hidden[:, :, 1:].float()                                                 # (1, 16, T_lat, H', W')
+        final_latents = wan_vae_denormalize(final_latents, latents_mean, latents_std_inv).to(vae.dtype)
+        video = vae.decode(final_latents, return_dict=False)[0]                                        # (1, 3, T, H, W)
+        frames = video[0].clamp(-1, 1).permute(1, 2, 3, 0)                                             # (T, H, W, 3) in [-1, 1]
+        frames = (((frames + 1) * 127.5).round().clamp(0, 255)).byte().cpu().numpy()
+        return frames
+    finally:
+        transformer.train()
+
+
 @torch.no_grad()
 def encode_video_with_wan_vae(vae, video_thwc_or_btchw: torch.Tensor,
                               mean: torch.Tensor, std_inv: torch.Tensor) -> torch.Tensor:
@@ -183,9 +273,15 @@ def build_vace_control(target_latents: torch.Tensor,
     B, C, T_lat, H, W = target_latents.shape
     dev, dt = target_latents.device, target_latents.dtype
 
-    # 32-ch video part: inactive (cached vae(zeros)) + reactive (target).
+    # 32-ch video part: BOTH halves are vae(zeros). We deliberately do NOT put the
+    # target in `reactive` — that would leak the answer through the conditioning
+    # channel during training (model trivially shortcuts to copying it).  At inference
+    # there's no target to put in reactive (the pipeline encodes a placeholder video),
+    # so making training match means reactive = inactive = vae(zeros).  The model
+    # learns to use *only* the reference image (prepended frame) as conditioning.
     inactive_part = inactive_zero_latent.expand(B, -1, -1, -1, -1).to(dt)
-    body          = torch.cat([inactive_part, target_latents], dim=1)     # (B, 32, T_lat, H', W')
+    reactive_part = inactive_zero_latent.expand(B, -1, -1, -1, -1).to(dt)
+    body          = torch.cat([inactive_part, reactive_part], dim=1)      # (B, 32, T_lat, H', W')
 
     # Reference frame: zero-pad to 32 ch, prepend along time.
     ref_pad   = torch.cat([reference_latent, torch.zeros_like(reference_latent)], dim=1)  # (B, 32, 1, H', W')
@@ -336,6 +432,67 @@ def main():
         num_workers=args.dataloader_num_workers, drop_last=True, pin_memory=True,
     )
 
+    # Held-out validation sample — deterministically pick by INDEX into the
+    # sorted pair list (bypassing the dataset's internal random.choice).
+    # Load the raw EXR directly with the same 99th-percentile normalisation
+    # the dataset uses, so the val reference is reproducible AND we know
+    # exactly which file it is.
+    if not hasattr(dataset, "pairs") or len(dataset.pairs) == 0:
+        raise RuntimeError("RawHDRPairDataset has no .pairs attribute — can't pick val sample deterministically.")
+    val_idx = args.validation_sample_index % len(dataset.pairs)
+    val_raw_path, val_gt_path = dataset.pairs[val_idx]
+
+    # Load + normalize the same way the dataset does (raw / p99, clipped to [-1, 1]).
+    import HDRutils.io as _hdr_io
+    _raw = _hdr_io.imread(val_raw_path).astype("float32")
+    if _raw.ndim == 2:
+        _raw = np.stack([_raw] * 3, axis=-1)
+    _raw = np.maximum(_raw[..., :3], 0.0)
+    _p99 = max(float(np.percentile(_raw, 99)), 1e-6)
+    _raw_norm = np.clip(_raw / _p99, 0.0, 1.0)                                        # (H, W, 3) in [0, 1]
+
+    val_dir = os.path.join(args.output_dir, "validation")
+    os.makedirs(val_dir, exist_ok=True)
+    from PIL import Image as _PIL
+    # Save reference twice: linear (raw-looking, possibly dark) + γ-encoded for sanity.
+    _PIL.fromarray((_raw_norm * 255).round().clip(0, 255).astype("uint8")).save(
+        os.path.join(val_dir, "reference_linear.png"))
+    _PIL.fromarray(((_raw_norm ** (1.0/2.2)) * 255).round().clip(0, 255).astype("uint8")).save(
+        os.path.join(val_dir, "reference_gamma.png"))
+
+    val_ref_thwc   = torch.from_numpy(_raw_norm)                                       # (H, W, 3) in [0, 1]
+    val_ref_neg1to1 = val_ref_thwc * 2.0 - 1.0                                         # (H, W, 3) in [-1, 1]
+
+    # ─── GT bracket for metrics ─────────────────────────────────────────
+    # Tone-map the paired HDR file with DETERMINISTIC EV ladder (linspace, no jitter)
+    # so the GT bracket is identical every val step.  Matches the dataset's tone-map.
+    _gt = read_hdr_image_float32(val_gt_path)                                          # (H, W, 3) linear HDR
+    _gt_t = torch.from_numpy(_gt).permute(2, 0, 1).contiguous()
+    _Y = (_gt_t[0] * 0.2126 + _gt_t[1] * 0.7152 + _gt_t[2] * 0.0722).clamp(min=1e-6)
+    _gamma  = 2.2
+    _Ymax     = _Y.max().item()
+    _Ymedian  = _Y.median().item()
+    _start_ev = float(np.log2((0.85 ** _gamma) / _Ymax))
+    _end_ev   = float(np.log2((0.85 ** _gamma) / _Ymedian))
+    val_ev_values = torch.linspace(_start_ev, _end_ev, args.num_frames).numpy()
+    val_gt_ldr    = hdr_to_ldr_batch_np(_gt, val_ev_values, gamma=_gamma)               # (T, H, W, 3) in [0, 1]
+    val_gt_uint8  = (np.clip(val_gt_ldr, 0, 1) * 255).round().astype("uint8")            # (T, H, W, 3)
+    # Save GT strip + per-frame PNGs for visual reference.
+    _gt_strip = np.concatenate([val_gt_uint8[i] for i in range(val_gt_uint8.shape[0])], axis=1)
+    _PIL.fromarray(_gt_strip).save(os.path.join(val_dir, "gt_strip.png"))
+    for i in range(val_gt_uint8.shape[0]):
+        _PIL.fromarray(val_gt_uint8[i]).save(os.path.join(val_dir, f"gt_f{i:02d}.png"))
+
+    val_metrics_path = os.path.join(args.output_dir, "val_metrics.json")
+    val_metrics_history = {"steps": [], "psnr_mean": [], "ssim_mean": [],
+                           "psnr_per_frame": [], "ssim_per_frame": []}
+
+    if accelerator.is_main_process:
+        logger.info(f"Val sample idx={val_idx}/{len(dataset.pairs)}  "
+                    f"→ {os.path.basename(val_raw_path)}")
+        logger.info(f"  reference_linear/gamma.png + gt_strip.png + gt_f*.png saved to {val_dir}/")
+        logger.info(f"  val GT EV ladder: [{_start_ev:+.2f}, ..., {_end_ev:+.2f}] across {args.num_frames} frames")
+
     # ─── Optimiser / scheduler ────────────────────────────────────────────
     optim = torch.optim.AdamW(
         trainable_params, lr=args.learning_rate,
@@ -407,7 +564,12 @@ def main():
                     return_dict=False,
                 )[0]                                                      # (B, 16, T_lat+1, H', W')
 
-                loss = F.mse_loss(model_out.float(), v_target.float())
+                # Skip the reference frame (time index 0) in the loss.  The model trivially
+                # denoises position 0 back to the reference because the clean reference is
+                # also in control_hidden_states[:, :, 0] — that would dominate the loss and
+                # short-circuit actual generation learning.  Only score the T_lat *bracket*
+                # frames at positions 1..T_lat+1.
+                loss = F.mse_loss(model_out[:, :, 1:].float(), v_target[:, :, 1:].float())
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -435,6 +597,100 @@ def main():
                                 "step":   global_step},
                                os.path.join(ckpt_dir, "lora_weights.pt"))
                     logger.info(f"Saved LoRA checkpoint → {ckpt_dir}")
+
+                # ── Validation render (multi-seed + PSNR/SSIM vs GT) ───────
+                if (args.validation_steps > 0
+                        and global_step % args.validation_steps == 0
+                        and accelerator.is_main_process):
+                    import numpy as _np
+                    logger.info(f"Running validation at step {global_step} "
+                                f"(seeds=[0..{args.num_validation_samples-1}], "
+                                f"num_inference_steps={args.num_validation_inference_steps}) …")
+                    unwrapped_t = accelerator.unwrap_model(transformer)
+                    step_dir = os.path.join(val_dir, f"step{global_step:06d}")
+                    os.makedirs(step_dir, exist_ok=True)
+                    seed_psnrs, seed_ssims = [], []
+                    seed_strips = []
+                    per_seed_per_frame_psnr = []
+                    per_seed_per_frame_ssim = []
+                    for seed in range(args.num_validation_samples):
+                        frames = render_validation(
+                            unwrapped_t, vae, scheduler, empty_text_embed,
+                            val_ref_neg1to1.to(accelerator.device),
+                            latents_mean, latents_std_inv, inactive_zero_latent,
+                            num_inference_steps=args.num_validation_inference_steps,
+                            resolution=args.resolution,
+                            device=accelerator.device, dtype=weight_dtype,
+                            noise_seed=seed,
+                        )
+                        # Save per-frame + strip for this seed.
+                        seed_dir = os.path.join(step_dir, f"seed{seed}")
+                        os.makedirs(seed_dir, exist_ok=True)
+                        for i in range(frames.shape[0]):
+                            _PIL.fromarray(frames[i]).save(os.path.join(seed_dir, f"f{i:02d}.png"))
+                        strip = _np.concatenate([frames[i] for i in range(frames.shape[0])], axis=1)
+                        _PIL.fromarray(strip).save(
+                            os.path.join(val_dir, f"strip_step{global_step:06d}_seed{seed}.png"))
+                        seed_strips.append(strip)
+                        # Metrics vs GT.
+                        m = compute_metrics(frames, val_gt_uint8)
+                        seed_psnrs.append(m["psnr_mean"])
+                        seed_ssims.append(m["ssim_mean"])
+                        per_seed_per_frame_psnr.append(m["psnr_per_frame"])
+                        per_seed_per_frame_ssim.append(m["ssim_per_frame"])
+
+                    # Aggregate.
+                    mean_psnr = float(_np.mean(seed_psnrs))
+                    mean_ssim = float(_np.mean(seed_ssims))
+                    best_psnr = float(_np.max(seed_psnrs))
+                    best_ssim = float(_np.max(seed_ssims))
+                    # Per-frame mean (over seeds).
+                    pf_psnr_mean = _np.mean(per_seed_per_frame_psnr, axis=0).tolist()
+                    pf_ssim_mean = _np.mean(per_seed_per_frame_ssim, axis=0).tolist()
+
+                    logger.info(f"  PSNR per-seed (mean over frames): "
+                                f"{[f'{p:.2f}' for p in seed_psnrs]}  "
+                                f"→ mean {mean_psnr:.2f}  best {best_psnr:.2f}")
+                    logger.info(f"  SSIM per-seed (mean over frames): "
+                                f"{[f'{s:.3f}' for s in seed_ssims]}  "
+                                f"→ mean {mean_ssim:.3f}  best {best_ssim:.3f}")
+                    logger.info(f"  PSNR per-frame (mean over seeds): "
+                                f"{[f'{p:.2f}' for p in pf_psnr_mean]}")
+
+                    # Append history + persist.
+                    val_metrics_history["steps"].append(global_step)
+                    val_metrics_history["psnr_mean"].append(mean_psnr)
+                    val_metrics_history["ssim_mean"].append(mean_ssim)
+                    val_metrics_history["psnr_per_frame"].append(pf_psnr_mean)
+                    val_metrics_history["ssim_per_frame"].append(pf_ssim_mean)
+                    import json as _json
+                    with open(val_metrics_path, "w") as _f:
+                        _json.dump(val_metrics_history, _f, indent=2)
+
+                    # Scalars → accelerator log (goes to whichever tracker is active).
+                    val_payload = {
+                        "val/psnr_mean":  mean_psnr,
+                        "val/psnr_best":  best_psnr,
+                        "val/ssim_mean":  mean_ssim,
+                        "val/ssim_best":  best_ssim,
+                    }
+                    for i in range(len(pf_psnr_mean)):
+                        val_payload[f"val/f{i}/psnr"] = pf_psnr_mean[i]
+                        val_payload[f"val/f{i}/ssim"] = pf_ssim_mean[i]
+                    accelerator.log(val_payload, step=global_step)
+
+                    # Image → direct wandb (accelerator.log doesn't support wandb.Image).
+                    if args.report_to in ("wandb", "all"):
+                        try:
+                            import wandb as _wandb
+                            if _wandb.run is not None:
+                                img_payload = {}
+                                for seed_i, strip in enumerate(seed_strips):
+                                    img_payload[f"val/strip_seed{seed_i}"] = _wandb.Image(
+                                        strip, caption=f"step {global_step} seed {seed_i} | psnr {seed_psnrs[seed_i]:.2f}")
+                                _wandb.log(img_payload, step=global_step)
+                        except Exception as e:
+                            logger.warning(f"wandb val strip image log skipped: {e}")
 
                 if global_step >= args.max_train_steps:
                     break
