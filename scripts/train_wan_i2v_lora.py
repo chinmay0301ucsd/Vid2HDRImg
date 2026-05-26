@@ -34,6 +34,8 @@ import argparse
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 
 import numpy as np
@@ -64,6 +66,29 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.dataset_hdr import RawHDRPairDataset, hdr_to_ldr_batch_np, read_hdr_image_float32
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_resume_path(spec, output_dir):
+    """Map --resume_from_checkpoint to a concrete lora-N dir, or None.
+
+    Accepts an absolute dir path, the literal "latest" (highest-N lora-N under
+    output_dir that has a train_state.pt), or None.
+    """
+    if not spec:
+        return None
+    if spec != "latest":
+        return spec if os.path.isdir(spec) else None
+    if not os.path.isdir(output_dir):
+        return None
+    cands = []
+    for name in os.listdir(output_dir):
+        m = re.fullmatch(r"lora-(\d+)", name)
+        if m and os.path.exists(os.path.join(output_dir, name, "train_state.pt")):
+            cands.append((int(m.group(1)), os.path.join(output_dir, name)))
+    if not cands:
+        return None
+    cands.sort()
+    return cands[-1][1]
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
@@ -97,19 +122,55 @@ def parse_args():
     p.add_argument("--lora_rank",        type=int, default=64)
     p.add_argument("--lora_alpha",       type=int, default=64)
     p.add_argument("--lora_dropout",     type=float, default=0.0)
+    p.add_argument("--target_modules",   type=str,
+                   default="to_q,to_k,to_v,to_out.0,ffn.net.0.proj,ffn.net.2,proj_out",
+                   help="Comma-separated PEFT target_modules. Default = attn (self+cross) + FFN + "
+                        "patch-unembed (matches v3). Pass an expanded set like "
+                        "'to_q,to_k,to_v,to_out.0,add_k_proj,add_v_proj,ffn.net.0.proj,ffn.net.2,proj_out' "
+                        "to also LoRA the image-stream KV projections in cross-attn (Wan I2V's "
+                        "attn2 has separate add_k_proj/add_v_proj for image features).")
 
+    p.add_argument("--sigma_distribution", choices=["uniform", "logit_normal"],
+                   default="uniform",
+                   help="Base sigma distribution before flow_shift is applied.\n"
+                        "  uniform (DEFAULT) — sigma_raw ~ U(0, 1). Matches what the inference\n"
+                        "      UniPC scheduler walks through (linspace from σ_max → σ_min, with\n"
+                        "      the same flow_shift transform applied on top).\n"
+                        "  logit_normal — sigma_raw = sigmoid(N(mean, std)). SD3-style; biases\n"
+                        "      toward σ≈0.5 (after sigmoid) before shifting. Kept for ablation.")
     p.add_argument("--logit_normal_mean", type=float, default=0.0,
-                   help="Logit-normal sigma sampling mean (sigma = sigmoid(N(mean, std))).")
-    p.add_argument("--logit_normal_std",  type=float, default=1.0)
-    p.add_argument("--editable_input", action="store_true", default=True,
-                   help="SVD-style: broadcast raw across all frames, mask=zeros — model "
-                        "can freely modify the input.  Default ON.")
-    p.add_argument("--strict_i2v", dest="editable_input", action="store_false",
-                   help="Wan I2V default: lock frame 0 = reference image, generate frames 1..T.")
+                   help="Only used if --sigma_distribution=logit_normal.")
+    p.add_argument("--logit_normal_std",  type=float, default=1.0,
+                   help="Only used if --sigma_distribution=logit_normal.")
+    p.add_argument("--flow_shift", type=float, default=None,
+                   help="Flow-matching shift applied to sigma_raw: "
+                        "sigma = flow_shift * sigma_raw / (1 + (flow_shift - 1) * sigma_raw). "
+                        "If None, reads from scheduler.config.flow_shift "
+                        "(3.0 for Wan 2.1 I2V, 5.0 for Wan 2.2 TI2V).")
+    p.add_argument("--ref_mode",
+                   choices=["wan_i2v_anchored", "soft_wan_ref", "strict_i2v", "editable"],
+                   default="wan_i2v_anchored",
+                   help="Layout of the 20-ch I2V conditioning tensor:\n"
+                        "  wan_i2v_anchored (DEFAULT) — target_video=[ref, bracket_0..T-1] (T+1 pixel\n"
+                        "      frames), conditioning latent=[ref, 0, ..., 0], mask=[1, 0, ..., 0].\n"
+                        "      Matches Wan I2V's pretrained convention exactly: frame 0 is the\n"
+                        "      anchor (target == conditioning), frames 1..T are the editable bracket.\n"
+                        "      Loss is computed on all latents but the anchor slot is trivial because\n"
+                        "      target == conditioning there.\n"
+                        "  soft_wan_ref — target=bracket (T frames), latent=[ref, 0, ...], mask=zeros.\n"
+                        "      No anchor; ref appears only in the conditioning channels.\n"
+                        "  strict_i2v — target=bracket, latent=[ref, 0, ...], mask=[1, 0, ...].\n"
+                        "      Target frame 0 = bracket_0 but mask claims frame 0 = ref → inconsistent;\n"
+                        "      kept as a baseline for ablation.\n"
+                        "  editable — target=bracket, latent=ref broadcast to all T frames,\n"
+                        "      mask=zeros. SVD-style soft reference.")
 
     p.add_argument("--mixed_precision",  default="bf16", choices=["no", "fp16", "bf16"])
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--checkpointing_steps", type=int, default=1000)
+    p.add_argument("--keep_last_n_checkpoints", type=int, default=3,
+                   help="Delete older lora-N checkpoints, keeping only the N most recent. "
+                        "Set to 0 to keep all. lora-final is never pruned.")
     p.add_argument("--logging_steps",       type=int, default=10)
     p.add_argument("--validation_steps",    type=int, default=500,
                    help="Run periodic validation render (0 to disable).")
@@ -119,6 +180,10 @@ def parse_args():
     p.add_argument("--report_to",           default="tensorboard",
                    choices=["tensorboard", "wandb", "all", "none"])
     p.add_argument("--use_noisy_samples",   action="store_true", default=True)
+    p.add_argument("--resume_from_checkpoint", type=str, default=None,
+                   help="Path to a lora-N checkpoint dir, or 'latest' to auto-find "
+                        "the highest-step lora-N under --output_dir. Restores LoRA "
+                        "weights, optimizer, LR scheduler, and global_step.")
     return p.parse_args()
 
 
@@ -167,40 +232,41 @@ def encode_video_with_wan_vae(vae, video_btchw, mean, std_inv):
 def build_i2v_condition(ref_image_b3hw: torch.Tensor, num_frames: int,
                         vae, latents_mean, latents_std_inv,
                         vae_scale_factor_temporal: int = 4,
-                        editable_input: bool = True) -> torch.Tensor:
-    """Construct the I2V conditioning tensor that gets channel-concat'd to noisy latents.
+                        ref_mode: str = "wan_i2v_anchored") -> torch.Tensor:
+    """Build the 20-ch conditioning tensor that gets channel-concat'd to noisy latents.
 
-    Two modes:
+    Modes (see --ref_mode in parse_args for the full user-facing description):
 
-      editable_input=True (DEFAULT — SVD-style "image as soft reference"):
-        - video_condition = ref_image broadcast across ALL T frames
-        - latent_condition = vae.encode(broadcast video)              (B, 16, T_lat, H', W')
-        - mask_lat_size = ALL ZEROS (no frame is fixed) → (B, 4, T_lat, H', W')
-        - condition = cat([mask, latent_condition], ch)               (B, 20, T_lat, H', W')
-        Model sees the reference at every temporal position via latent_condition and
-        is free to modify it — none of the output frames are forced to equal the input.
-        Matches SVD's "image latents repeated across time" conditioning pattern.
+      wan_i2v_anchored / strict_i2v:
+        - video_condition = [ref, 0, ..., 0]   (ref at frame 0, zeros elsewhere)
+        - mask = [1, 0, ..., 0] at the FIRST latent slot only (which corresponds to
+          pixel frame 0 in the Wan VAE)
+        These two modes produce identical conditioning here; they differ only in how
+        the training loop builds the *target* video.
 
-      editable_input=False (standard Wan I2V):
-        - video_condition = [ref, zeros, zeros, ...] (ref only at frame 0)
-        - latent_condition = vae.encode(this padded video)
-        - mask_lat_size: first frame = 1, rest = 0, packed temporally
-        - Model is constrained to preserve frame 0 = reference image.
+      soft_wan_ref:
+        - video_condition = [ref, 0, ..., 0]
+        - mask = all zeros
+
+      editable:
+        - video_condition = ref broadcast across all T frames
+        - mask = all zeros
 
     Args:
-        ref_image_b3hw : (B, 3, H, W) in [-1, 1]
-        num_frames     : T pixel frames (= dataset num_frames)
-        editable_input : True → broadcast + no mask (default); False → fixed first frame.
+        num_frames : T pixel frames the model will operate on. For wan_i2v_anchored,
+                     this is (bracket_size + 1) — the anchor frame counts as one of the T.
     """
+    if ref_mode not in ("wan_i2v_anchored", "soft_wan_ref", "strict_i2v", "editable"):
+        raise ValueError(f"unknown ref_mode={ref_mode!r}")
     B, _, H, W = ref_image_b3hw.shape
     device = ref_image_b3hw.device
     dtype  = ref_image_b3hw.dtype
 
-    if editable_input:
+    if ref_mode == "editable":
         # Broadcast the reference across every temporal slot (SVD-style).
         video_condition = ref_image_b3hw.unsqueeze(2).expand(B, 3, num_frames, H, W).contiguous()
     else:
-        # Original Wan I2V: reference at frame 0 only, rest zeros.
+        # wan_i2v_anchored / soft_wan_ref / strict_i2v: ref at frame 0, zeros elsewhere.
         image = ref_image_b3hw.unsqueeze(2)                                # (B, 3, 1, H, W)
         zeros_pad = image.new_zeros(B, 3, num_frames - 1, H, W)
         video_condition = torch.cat([image, zeros_pad], dim=2)             # (B, 3, T, H, W)
@@ -212,20 +278,16 @@ def build_i2v_condition(ref_image_b3hw: torch.Tensor, num_frames: int,
     latH  = latent_condition.shape[3]
     latW  = latent_condition.shape[4]
 
-    # Build pixel-space mask: all zeros if editable, [1, 0, 0, ...] otherwise.
-    mask_lat_size = torch.zeros(B, 1, num_frames, latH, latW, device=device, dtype=dtype)
-    if not editable_input:
-        mask_lat_size[:, :, 0] = 1.0
+    # Mask lives directly in latent space: (B, 4, T_lat, H', W'). Slot 0 corresponds
+    # to pixel frame 0 in the Wan VAE (the encoder treats the first frame as a clean
+    # key frame; subsequent latent slots fuse blocks of pixel frames). This simpler
+    # form is functionally equivalent to the temporal-packing dance used previously
+    # for T_pix ∈ {1, 5, 9, 13, ...} and additionally supports arbitrary T_pix.
+    mask_lat = torch.zeros(B, 4, T_lat, latH, latW, device=device, dtype=dtype)
+    if ref_mode in ("strict_i2v", "wan_i2v_anchored"):
+        mask_lat[:, :, 0] = 1.0
 
-    # Pack temporally so the mask matches latent_condition's T_lat (4-channel encoding).
-    first_frame_mask = mask_lat_size[:, :, 0:1]                            # (B, 1, 1, h, w)
-    first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2,
-                                                repeats=vae_scale_factor_temporal)
-    mask_lat_size = torch.cat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
-    mask_lat_size = mask_lat_size.view(B, -1, vae_scale_factor_temporal, latH, latW)
-    mask_lat_size = mask_lat_size.transpose(1, 2)                          # (B, 4, T_lat, H', W')
-
-    return torch.cat([mask_lat_size.to(dtype), latent_condition], dim=1)   # (B, 20, T_lat, H', W')
+    return torch.cat([mask_lat, latent_condition], dim=1)                  # (B, 20, T_lat, H', W')
 
 
 # ─── Metric helpers ────────────────────────────────────────────────────────
@@ -297,7 +359,8 @@ def render_validation_i2v(transformer, vae, scheduler, text_embed,
                           latents_mean, latents_std_inv,
                           num_inference_steps: int, num_frames: int,
                           resolution: int, device, dtype,
-                          noise_seed: int = 0) -> np.ndarray:
+                          noise_seed: int = 0,
+                          ref_mode: str = "soft_wan_ref") -> np.ndarray:
     """Run a short I2V denoising loop using the same conditioning as training.
     Returns (T, H, W, 3) uint8 generated frames."""
     transformer.eval()
@@ -306,11 +369,13 @@ def render_validation_i2v(transformer, vae, scheduler, text_embed,
         image_embeds = clip_encode_image(image_encoder, feat_processor,
                                           ref_uint8_hwc[None], device, dtype)   # (1, 1, D_img)
 
-        # 2. Build I2V conditioning (20 ch).  editable_input defaults to True
-        # (SVD-style); the training-side flag controls this for non-default runs.
-        condition = build_i2v_condition(ref_image_b3hw_minus1to1, num_frames,
+        # 2. Build I2V conditioning (20 ch). Must match the training-time ref_mode
+        # or the model sees an off-distribution conditioning layout. In anchored mode
+        # the model operates on T+1 pixel frames (frame 0 = anchor, frames 1..T = bracket).
+        cond_pixel_frames = num_frames + 1 if ref_mode == "wan_i2v_anchored" else num_frames
+        condition = build_i2v_condition(ref_image_b3hw_minus1to1, cond_pixel_frames,
                                          vae, latents_mean, latents_std_inv,
-                                         editable_input=True)                    # (1, 20, T_lat, H', W')
+                                         ref_mode=ref_mode)                      # (1, 20, T_lat, H', W')
 
         # 3. Init noise (1, 16, T_lat, H', W') with deterministic seed.
         T_lat = condition.shape[2]
@@ -336,7 +401,13 @@ def render_validation_i2v(transformer, vae, scheduler, text_embed,
         latents = wan_vae_denormalize(latents.float(), latents_mean, latents_std_inv).to(vae.dtype)
         video = vae.decode(latents, return_dict=False)[0]                       # (1, 3, T_pix, H, W)
         frames = video[0].clamp(-1, 1).permute(1, 2, 3, 0)                      # (T_pix, H, W, 3)
-        return (((frames + 1) * 127.5).round().clamp(0, 255)).byte().cpu().numpy()
+        frames_u8 = (((frames + 1) * 127.5).round().clamp(0, 255)).byte().cpu().numpy()
+        if ref_mode == "wan_i2v_anchored":
+            # Drop frame 0 — that slot is the anchor (should reconstruct the ref).
+            # The "predicted bracket" lives at frames 1..num_frames, which is what
+            # we compare against val_gt_uint8.
+            frames_u8 = frames_u8[1:1 + num_frames]
+        return frames_u8
     finally:
         transformer.train()
 
@@ -395,9 +466,25 @@ def main():
     vae_temporal_factor = getattr(vae.config, "temperal_downsample_factor", None) or 4
 
     # ─── LoRA ─────────────────────────────────────────────────────────────
+    # Targets: attention Q/K/V/out plus the FFN's two linears. The FFN
+    # provides the per-token feature transformation capacity that attn-only
+    # LoRA lacks — important for tasks where the model needs to *reshape*
+    # features per frame (e.g., per-EV bracket prediction), not just route
+    # information between tokens.
+    #
+    # PEFT matches target_modules by suffix. Wan's WanTransformerBlock uses
+    # `ffn.net.0.proj` (GEGLU gate+up) and `ffn.net.2` (output proj) for the
+    # FFN; if the actual module names differ in your diffusers version, peft
+    # will silently skip them. The "FFN LoRA modules targeted" log line below
+    # is the sanity check — if the trainable param count doesn't roughly
+    # double over attn-only (was ~210 M, should now be ~450-500 M), the FFN
+    # names didn't match and you need to inspect `print(transformer)`.
+    target_modules_list = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+    if accelerator.is_main_process:
+        logger.info(f"LoRA target_modules: {target_modules_list}")
     lora_config = LoraConfig(
         r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        target_modules=target_modules_list,
         bias="none", init_lora_weights="gaussian",
     )
     transformer.add_adapter(lora_config)
@@ -406,9 +493,14 @@ def main():
         p.data = p.data.to(torch.float32)
     n_trainable = sum(p.numel() for p in trainable_params)
     n_total     = sum(p.numel() for p in transformer.parameters())
+    # Count how many FFN modules got LoRA adapters attached (sanity check).
+    n_ffn_adapters = sum(1 for n, _ in transformer.named_modules()
+                          if ("ffn" in n) and n.endswith(("lora_A.default", "lora_B.default")))
     if accelerator.is_main_process:
         logger.info(f"Transformer params: {n_total/1e9:.2f} B total, "
                     f"{n_trainable/1e6:.2f} M trainable LoRA ({100*n_trainable/n_total:.3f}%)")
+        logger.info(f"FFN LoRA modules targeted: {n_ffn_adapters} "
+                    f"(expect > 0 if FFN module names matched; else check `print(transformer)`)")
 
     transformer.to(accelerator.device)
     vae.to(accelerator.device)
@@ -453,8 +545,13 @@ def main():
     _PIL.fromarray(((_raw_norm ** (1/2.2)) * 255).round().clip(0,255).astype("uint8")).save(
         os.path.join(val_dir, "reference_gamma.png"))
 
-    val_ref_uint8     = ((_raw_norm ** (1/2.2)) * 255).round().clip(0,255).astype("uint8")  # for CLIP
-    val_ref_neg1to1   = torch.from_numpy(_raw_norm).permute(2,0,1).unsqueeze(0) * 2.0 - 1.0  # (1,3,H,W)
+    # CLIP must see the SAME thing it sees in training: training feeds the linear raw
+    # in [-1, 1] converted to uint8 (see ref_for_clip in the train loop), NOT a
+    # gamma-corrected version. Mismatching these creates an out-of-distribution CLIP
+    # embedding at inference and the model produces noise (PSNR ~7).
+    val_ref_uint8         = (_raw_norm * 255).round().clip(0,255).astype("uint8")              # for CLIP (linear, matches training)
+    val_ref_display_uint8 = ((_raw_norm ** (1/2.2)) * 255).round().clip(0,255).astype("uint8")  # gamma-corrected, panels only
+    val_ref_neg1to1       = torch.from_numpy(_raw_norm).permute(2,0,1).unsqueeze(0) * 2.0 - 1.0  # (1,3,H,W)
 
     # GT bracket
     _gt   = read_hdr_image_float32(val_gt_path)
@@ -493,10 +590,47 @@ def main():
 
     num_train_timesteps = scheduler.config.num_train_timesteps  # typically 1000
 
-    # ─── Train loop ───────────────────────────────────────────────────────
+    # Resolve flow_shift: if user didn't pass --flow_shift, read it from the loaded
+    # scheduler config (3.0 for Wan 2.1 I2V, 5.0 for Wan 2.2 TI2V). Matching the
+    # scheduler's flow_shift at training time is what makes the model see the same
+    # σ → timestep mapping at training as it sees at inference.
+    if args.flow_shift is None:
+        args.flow_shift = float(getattr(scheduler.config, "flow_shift", 1.0))
+    if accelerator.is_main_process:
+        logger.info(f"Sigma sampling: distribution={args.sigma_distribution}, "
+                    f"flow_shift={args.flow_shift}")
+
+    # ─── Resume ───────────────────────────────────────────────────────────
     global_step = 0
+    resume_path = _resolve_resume_path(args.resume_from_checkpoint, args.output_dir)
+    if resume_path is not None:
+        from peft import set_peft_model_state_dict
+        if accelerator.is_main_process:
+            logger.info(f"Resuming from {resume_path}")
+        unwrapped = accelerator.unwrap_model(transformer)
+        lora_blob = torch.load(os.path.join(resume_path, "lora_weights.pt"),
+                                map_location="cpu", weights_only=False)
+        set_peft_model_state_dict(unwrapped, lora_blob["lora_state_dict"])
+        train_state = torch.load(os.path.join(resume_path, "train_state.pt"),
+                                  map_location="cpu", weights_only=False)
+        optim.load_state_dict(train_state["optim"])
+        lr_sched.load_state_dict(train_state["lr_sched"])
+        global_step = int(train_state["global_step"])
+        if accelerator.is_main_process:
+            logger.info(f"Resumed at global_step={global_step}")
+        accelerator.wait_for_everyone()
+    elif args.resume_from_checkpoint and accelerator.is_main_process:
+        logger.info(f"--resume_from_checkpoint={args.resume_from_checkpoint!r} "
+                    f"did not resolve to a checkpoint — starting from step 0")
+
+    # ─── Train loop ───────────────────────────────────────────────────────
     transformer.train()
-    logger.info("Starting training …")
+    if global_step >= args.max_train_steps:
+        if accelerator.is_main_process:
+            logger.info(f"global_step ({global_step}) >= max_train_steps "
+                        f"({args.max_train_steps}); nothing to do.")
+    else:
+        logger.info("Starting training …")
 
     while global_step < args.max_train_steps:
         for batch in train_dl:
@@ -505,15 +639,26 @@ def main():
                 ref_img = batch["raw_input"].to(accelerator.device, dtype=weight_dtype)
                 B, T, C_in, H, W = clean.shape
 
-                # 1. VAE-encode bracket.
-                video = clean.permute(0, 2, 1, 3, 4).contiguous()            # (B, 3, T, H, W)
+                # 1. Build target pixel video and VAE-encode.
+                bracket_video = clean.permute(0, 2, 1, 3, 4).contiguous()    # (B, 3, T, H, W)
+                if args.ref_mode == "wan_i2v_anchored":
+                    # Prepend the reference as frame 0 — the target video is now
+                    # [ref, bracket_0, ..., bracket_{T-1}] with T_pix = T + 1. The
+                    # conditioning channels and the mask will also be built for T+1
+                    # frames below, so target frame 0 == conditioning frame 0 == ref
+                    # and the loss signal at that slot is trivially "preserve the anchor."
+                    video = torch.cat([ref_img.unsqueeze(2), bracket_video], dim=2)  # (B, 3, T+1, H, W)
+                    cond_pixel_frames = args.num_frames + 1
+                else:
+                    video = bracket_video
+                    cond_pixel_frames = args.num_frames
                 target_latents = encode_video_with_wan_vae(vae, video, latents_mean, latents_std_inv)
 
                 # 2. Build I2V conditioning (raw as the conditioning image).
-                condition = build_i2v_condition(ref_img, args.num_frames,
+                condition = build_i2v_condition(ref_img, cond_pixel_frames,
                                                  vae, latents_mean, latents_std_inv,
                                                  vae_scale_factor_temporal=vae_temporal_factor,
-                                                 editable_input=args.editable_input)
+                                                 ref_mode=args.ref_mode)
 
                 # 3. CLIP-encode raw for image cross-attention.
                 ref_for_clip = ((((ref_img + 1) * 127.5).round()
@@ -521,10 +666,19 @@ def main():
                 image_embeds = clip_encode_image(image_encoder, feat_processor,
                                                   ref_for_clip, accelerator.device, weight_dtype)
 
-                # 4. Sigma sampling — LOGIT-NORMAL (the Wan convention).
-                u = torch.randn(B, device=target_latents.device, dtype=torch.float32) \
-                    * args.logit_normal_std + args.logit_normal_mean
-                sigmas = torch.sigmoid(u)                                     # (B,) in (0, 1)
+                # 4. Sigma sampling. Match the inference UniPC schedule:
+                #    sigma_raw ~ Uniform(0, 1)  (or logit-normal, if --sigma_distribution=logit_normal)
+                #    sigma     = flow_shift * sigma_raw / (1 + (flow_shift - 1) * sigma_raw)
+                # The shift biases σ toward higher values; without it, training σ ≈ 0.5
+                # while inference σ ∈ (≈0.25, ≈0.96) for flow_shift=3 — a regime mismatch
+                # that the LoRA has to "see through" to denoise correctly.
+                if args.sigma_distribution == "uniform":
+                    sigma_raw = torch.rand(B, device=target_latents.device, dtype=torch.float32)
+                else:  # "logit_normal"
+                    u = torch.randn(B, device=target_latents.device, dtype=torch.float32) \
+                        * args.logit_normal_std + args.logit_normal_mean
+                    sigma_raw = torch.sigmoid(u)
+                sigmas = args.flow_shift * sigma_raw / (1.0 + (args.flow_shift - 1.0) * sigma_raw)
                 sigmas_v = sigmas.view(B, 1, 1, 1, 1).to(target_latents.dtype)
 
                 noise = torch.randn_like(target_latents)
@@ -533,6 +687,8 @@ def main():
 
                 # 5. Forward.
                 latent_model_input = torch.cat([noisy_latents, condition], dim=1)  # (B, 36, T_lat, H', W')
+                # Timestep uses the SHIFTED sigma so the model sees the same t at training
+                # as the inference scheduler will produce for the same noise level.
                 timestep = (sigmas * num_train_timesteps).long().clamp(0, num_train_timesteps - 1)
 
                 model_out = transformer(
@@ -543,7 +699,14 @@ def main():
                     return_dict=False,
                 )[0]                                                          # (B, 16, T_lat, H', W')
 
-                loss = F.mse_loss(model_out.float(), v_target.float())
+                if args.ref_mode == "wan_i2v_anchored":
+                    # Skip latent slot 0 — that's the anchor (target == conditioning),
+                    # supervising it would just pull the model around for no reason.
+                    # Loss is on slot 1: only, which holds the bracket frames' latent.
+                    loss = F.mse_loss(model_out[:, :, 1:].float(),
+                                       v_target[:, :, 1:].float())
+                else:
+                    loss = F.mse_loss(model_out.float(), v_target.float())
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -567,7 +730,23 @@ def main():
                     torch.save({"lora_state_dict": get_peft_model_state_dict(unwrapped),
                                 "config": vars(args), "step": global_step},
                                os.path.join(ckpt_dir, "lora_weights.pt"))
-                    logger.info(f"Saved LoRA → {ckpt_dir}")
+                    torch.save({"global_step": global_step,
+                                "optim": optim.state_dict(),
+                                "lr_sched": lr_sched.state_dict()},
+                               os.path.join(ckpt_dir, "train_state.pt"))
+                    logger.info(f"Saved LoRA + train state → {ckpt_dir}")
+
+                    if args.keep_last_n_checkpoints > 0:
+                        existing = []
+                        for name in os.listdir(args.output_dir):
+                            m = re.fullmatch(r"lora-(\d+)", name)
+                            if m:
+                                existing.append((int(m.group(1)),
+                                                 os.path.join(args.output_dir, name)))
+                        existing.sort()
+                        for _, old in existing[:-args.keep_last_n_checkpoints]:
+                            shutil.rmtree(old, ignore_errors=True)
+                            logger.info(f"Pruned old checkpoint → {old}")
 
                 # ── Validation render ──────────────────────────────────────
                 if (args.validation_steps > 0 and global_step % args.validation_steps == 0
@@ -590,6 +769,7 @@ def main():
                             num_inference_steps=args.num_validation_inference_steps,
                             num_frames=args.num_frames, resolution=args.resolution,
                             device=accelerator.device, dtype=weight_dtype, noise_seed=seed,
+                            ref_mode=args.ref_mode,
                         )
                         seed_dir = os.path.join(step_dir, f"seed{seed}"); os.makedirs(seed_dir, exist_ok=True)
                         for i in range(frames.shape[0]):
@@ -600,7 +780,7 @@ def main():
 
                         # Combined GT+pred panel with metrics annotated (like VDM_EVFI).
                         panel_rgb = make_gt_pred_panel(
-                            gt_uint8=val_gt_uint8, pred_uint8=frames, ref_uint8=val_ref_uint8,
+                            gt_uint8=val_gt_uint8, pred_uint8=frames, ref_uint8=val_ref_display_uint8,
                             psnrs=m["psnr_per_frame"], ssims=m["ssim_per_frame"],
                             step=global_step, seed=seed,
                             save_path=os.path.join(val_dir,

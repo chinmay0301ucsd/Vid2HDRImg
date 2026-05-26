@@ -11,16 +11,16 @@
 set -euo pipefail
 
 # ── Required ─────────────────────────────────────────────────────────────────
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/work1/javidi/shared/raw_hdr_dataset_v1}"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/work/nvme/bhcc/ctalegaonkar/datasets/raw_hdr_dataset_v1}"
 
 # ── Wan I2V model path ───────────────────────────────────────────────────────
-PRETRAINED_WAN="${PRETRAINED_WAN:-/work1/javidi/shared/Wan2.1-I2V-14B-480P-Diffusers}"
+PRETRAINED_WAN="${PRETRAINED_WAN:-/work/nvme/bhcc/ctalegaonkar/Vid2HDRImg/models/Wan2.1-I2V-14B-480P-Diffusers}"
 
 # ── Common overrides ─────────────────────────────────────────────────────────
-OUTPUT_DIR="${OUTPUT_DIR:-/work1/javidi/chinmay0301/Vid2HDRImg/outputs/wan_i2v_lora_v0}"
+OUTPUT_DIR="${OUTPUT_DIR:-/work/nvme/bhcc/ctalegaonkar/Vid2HDRImg/outputs/wan_i2v_lora_v0}"
 NUM_FRAMES="${NUM_FRAMES:-5}"
 RESOLUTION="${RESOLUTION:-512}"
-LR="${LR:-5e-5}"
+LR="${LR:-1e-4}"
 BSZ="${BSZ:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
@@ -49,8 +49,8 @@ export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-source /work1/javidi/chinmay0301/miniconda3/etc/profile.d/conda.sh
-conda activate vace_hdr
+source /work/nvme/bhcc/ctalegaonkar/miniconda3/etc/profile.d/conda.sh
+conda activate vid2hdr
 
 accelerate launch --num_processes "$NUM_PROCESSES" scripts/train_wan_i2v_lora.py \
     --pretrained_wan_path        "$PRETRAINED_WAN" \
