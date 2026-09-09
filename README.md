@@ -1,5 +1,9 @@
 # Vid2HDRImg
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](docs/INSTALL_CUDA.md)
+[![🤗 Weights](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Vid2HDRImg-yellow)](https://huggingface.co/chinmay0301/Vid2HDRImg)
+
 Recasting single-shot HDR image reconstruction as conditional video
 generation: a video diffusion model synthesises an exposure bracket from
 a single LDR input, and a lightweight U-Net fuses the bracket into the
@@ -9,7 +13,9 @@ final HDR image.
   <img src="assets/main_results_top5.jpg" width="100%" alt="Qualitative HDR comparisons against baselines">
 </p>
 
-## Abstract
+<details>
+<summary><b>Abstract</b></summary>
+<br>
 
 Recent generative methods for single-shot HDR image reconstruction show
 promising results, but often struggle with preserving fidelity to the
@@ -32,6 +38,18 @@ evaluators prefer our results in 72% of pairwise comparisons against
 existing methods. The framework also generalises beyond HDR to other
 computational imaging tasks, including all-in-focus image recovery
 from a single defocus-blurred input.
+</details>
+
+## Contents
+
+- [What's in this repo](#whats-in-this-repo)
+- [Installation](#installation)
+- [Pretrained checkpoints](#pretrained-checkpoints)
+- [Inference (single image)](#inference-single-image)
+- [Training](#training)
+- [Beyond HDR](#beyond-hdr)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
 
 ## What's in this repo
 
@@ -45,6 +63,20 @@ from a single defocus-blurred input.
 | `scripts/src/models/fusion_unet.py` | The fusion U-Net + helpers (`load_fusion_net`, `run_fusion_net_float`). |
 
 ## Installation
+
+Clone the repo:
+
+```bash
+git clone https://github.com/chinmay0301ucsd/Vid2HDRImg.git
+cd Vid2HDRImg
+```
+
+Create an isolated conda environment:
+
+```bash
+conda create -n vid2hdrimg python=3.10 -y
+conda activate vid2hdrimg
+```
 
 PyTorch is *not* listed in `requirements.txt` because the right wheel
 depends on your GPU stack. **Install PyTorch first**, then everything
@@ -102,21 +134,31 @@ for that download too.
 
 ## Inference (single image)
 
+A bash wrapper exposing the most common knobs as env vars is provided, and
+defaults to `weights/unet` / `weights/fusion_net.pt` (from the download above)
+and a bundled example SI-HDR input, so it runs out of the box with zero args:
+
+```bash
+bash scripts/run_inference.sh
+```
+
+Pass your own image and output path, and override model paths via env vars
+if you didn't download the weights to `weights/`:
+
+```bash
+UNET_PATH=weights/unet \
+FUSION_NET_PATH=weights/fusion_net.pt \
+    bash scripts/run_inference.sh example.jpg predicted.exr
+```
+
+Or call the underlying Python script directly:
+
 ```bash
 python scripts/inference.py \
     --input            example.jpg \
     --unet_path        weights/unet \
     --fusion_net_path  weights/fusion_net.pt \
     --output           predicted.exr
-```
-
-A bash wrapper is also provided that exposes the most common knobs as
-env vars:
-
-```bash
-UNET_PATH=weights/unet \
-FUSION_NET_PATH=weights/fusion_net.pt \
-    bash scripts/run_inference.sh example.jpg predicted.exr
 ```
 
 The script auto-detects the input type from the file extension: `.exr` /
