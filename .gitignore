@@ -49,6 +49,13 @@ datasets/
 !assets/*.jpg
 !assets/*.svg
 
+# Bundled example input for run_inference.sh's out-of-the-box default
+!assets/example_sihdr_input.exr
+
 # Internal scratch / smoke tests (not for release)
 .smoke.sh
 .smoke_outputs/
+
+# Local experiment checkpoints kept on disk but not committed
+chain_run/
+fusion_unet_4frames/

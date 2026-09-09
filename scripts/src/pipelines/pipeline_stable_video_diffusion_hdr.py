@@ -102,6 +102,7 @@ def retrieve_timesteps(
     sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
+    """Call `scheduler.set_timesteps` with custom timesteps/sigmas if given, else `num_inference_steps`."""
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed.")
     if timesteps is not None:
@@ -226,6 +227,7 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
         do_classifier_free_guidance: bool,
         clip_only_cfg: bool = False,
     ):
+        """VAE-encode the conditioning frame to a latent, duplicated/zeroed for CFG as needed."""
         image = image.to(device=device, dtype=self.vae.dtype)
         image_latents = self.vae.encode(image).latent_dist.mode()
 
@@ -249,6 +251,7 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
         num_videos_per_prompt: int,
         do_classifier_free_guidance: bool,
     ):
+        """Build the (fps, motion_bucket_id, noise_aug_strength) conditioning vector expected by the UNet."""
         add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
 
         passed_add_embed_dim = self.unet.config.addition_time_embed_dim * len(add_time_ids)
@@ -269,6 +272,7 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
         return add_time_ids
 
     def decode_latents(self, latents: torch.Tensor, num_frames: int, decode_chunk_size: int = 14):
+        """VAE-decode latents to pixel frames, chunked along the frame dim to bound memory."""
         latents = latents.flatten(0, 1)
         latents = 1 / self.vae.config.scaling_factor * latents
         latents = latents.to(dtype=self.vae.dtype)
@@ -291,6 +295,7 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
         return frames
 
     def check_inputs(self, image, height, width):
+        """Validate the conditioning image type and that height/width are VAE-compatible."""
         if (
             not isinstance(image, torch.Tensor)
             and not isinstance(image, PIL.Image.Image)
@@ -314,6 +319,7 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
         generator: torch.Generator,
         latents: Optional[torch.Tensor] = None,
     ):
+        """Sample (or reuse) initial noise latents, scaled by the scheduler's init sigma."""
         shape = (
             batch_size,
             num_frames,
@@ -337,16 +343,19 @@ class StableVideoDiffusionPipelineHDR(DiffusionPipeline):
 
     @property
     def guidance_scale(self):
+        """The (possibly per-frame) CFG scale set for the current `__call__`."""
         return self._guidance_scale
 
     @property
     def do_classifier_free_guidance(self):
+        """Whether any frame's guidance scale exceeds 1 (i.e. CFG is active)."""
         if isinstance(self.guidance_scale, (int, float)):
             return self.guidance_scale > 1
         return self.guidance_scale.max() > 1
 
     @property
     def num_timesteps(self):
+        """Number of denoising timesteps used by the current `__call__`."""
         return self._num_timesteps
 
     @torch.no_grad()

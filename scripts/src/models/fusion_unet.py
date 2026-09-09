@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 
 class _DoubleConv(nn.Module):
@@ -49,6 +50,7 @@ class FusionUNet(nn.Module):
         self.head = nn.Conv2d(b, num_frames, kernel_size=1)
 
     def forward(self, pixel_values: torch.Tensor):
+        """Predict per-pixel softmax fusion weights over the T frames and return the weighted-average fuse."""
         B, T, C, H, W = pixel_values.shape
         x = pixel_values.reshape(B, T * C, H, W)
         e1 = self.enc1(x)
@@ -134,6 +136,14 @@ def run_fusion_net_float(
     Y_ref    = 0.2126 * ref_hdr[..., 0] + 0.7152 * ref_hdr[..., 1] + 0.0722 * ref_hdr[..., 2]
     luma_max = float(np.maximum(Y_ref, 1e-6).max())
     return np.maximum(hdr_np * luma_max, 0.0).astype(np.float32), weights_np
+
+
+def save_bracket_pngs(frames_01: torch.Tensor, out_dir: str, stem: str = "f"):
+    """Save a (T, 3, H, W) frame stack in [0, 1] as individual gamma-encoded PNGs."""
+    os.makedirs(out_dir, exist_ok=True)
+    frames_u8 = (frames_01.clamp(0, 1) * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
+    for i in range(frames_u8.shape[0]):
+        Image.fromarray(frames_u8[i]).save(os.path.join(out_dir, f"{stem}{i:02d}.png"))
 
 
 def save_fusion_weights(weights_np: np.ndarray, out_dir: str, stem: str):

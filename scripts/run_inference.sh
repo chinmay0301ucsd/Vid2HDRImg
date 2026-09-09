@@ -14,7 +14,11 @@
 
 set -euo pipefail
 
-INPUT="${1:-${INPUT:-}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Defaults to a bundled example SI-HDR raw input (test_96 from the raw2hdr
+# SI-HDR testset) so the script runs out of the box with no args.
+INPUT="${1:-${INPUT:-$SCRIPT_DIR/../assets/example_sihdr_input.exr}}"
 OUTPUT="${2:-${OUTPUT:-predicted.exr}}"
 
 # Model paths — override via env vars or by editing the defaults below.
@@ -47,7 +51,6 @@ EOF
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 python scripts/inference.py \

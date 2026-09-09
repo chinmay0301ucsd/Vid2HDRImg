@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.pipelines.pipeline_stable_video_diffusion_hdr import (
     StableVideoDiffusionPipelineHDR,
 )
-from src.models.fusion_unet import load_fusion_net
+from src.models.fusion_unet import load_fusion_net, save_bracket_pngs
 
 import HDRutils.io as hdr_io
 from diffusers import (
@@ -137,6 +137,7 @@ def build_pipeline(args, device: torch.device) -> StableVideoDiffusionPipelineHD
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    """Parse CLI args, run the bracket-generation + fusion pipeline on one input image, and save the HDR output."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
 
@@ -231,6 +232,13 @@ def main():
 
     frames_01 = frames_pt.float().clamp(0, 1)
 
+    # ── Save the synthesised bracket ──────────────────────────────────────────
+    out_path = args.output
+    out_dir  = os.path.dirname(os.path.abspath(out_path)) or "."
+    bracket_dir = os.path.join(out_dir, f"{Path(out_path).stem}_bracket")
+    save_bracket_pngs(frames_01, bracket_dir)
+    log.info(f"Saved {frames_01.shape[0]}-frame bracket -> {bracket_dir}/f*.png")
+
     # ── Fuse into HDR ─────────────────────────────────────────────────────────
     # Re-create what `run_fusion_net_float` does, but scale the output to a
     # configurable peak luminance instead of using a GT reference.
@@ -240,9 +248,7 @@ def main():
     hdr_rel = hdr_pred_01[0].float().cpu().permute(1, 2, 0).numpy()  # (H, W, 3) in [0,~1]
     pred_hdr = np.maximum(hdr_rel * float(args.peak_lum), 0.0).astype(np.float32)
 
-    # ── Save EXR ──────────────────────────────────────────────────────────────
-    out_path = args.output
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    # ── Save fused HDR ────────────────────────────────────────────────────────
     hdr_io.imwrite(out_path, pred_hdr)
     log.info(f"Saved predicted HDR -> {out_path}  "
              f"(min={pred_hdr.min():.4g}, max={pred_hdr.max():.4g}, mean={pred_hdr.mean():.4g})")

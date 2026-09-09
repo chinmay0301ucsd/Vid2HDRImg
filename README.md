@@ -76,7 +76,9 @@ or BitsAndBytes — so they run on either backend without code changes.
 
 ## Pretrained checkpoints
 
-Download from the HuggingFace Hub:
+`chinmay0301/Vid2HDRImg` on the HuggingFace Hub hosts **only our extra,
+fine-tuned weights** (the Stage 1 UNet delta + the Stage 2 fusion net) — it is
+not a full model on its own. Download it with:
 
 ```bash
 huggingface-cli download chinmay0301/Vid2HDRImg --local-dir weights/
@@ -90,9 +92,13 @@ weights/
 └── fusion_net.pt         # fusion U-Net (Stage 2)
 ```
 
-> The base SVD model (the VAE / scheduler / image encoder used by Stage 1)
-> is downloaded automatically from `stabilityai/stable-video-diffusion-img2vid`
-> the first time you run inference.
+**You also need the base Stable Video Diffusion weights** (VAE, scheduler,
+CLIP image encoder, and the pretrained UNet these were fine-tuned from) — the
+fine-tuned UNet above is loaded on top of them. These are downloaded
+automatically from `stabilityai/stable-video-diffusion-img2vid` the first
+time you run inference (see [SVD model card](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid)),
+so make sure you have HuggingFace Hub access and enough disk space (~10 GB)
+for that download too.
 
 ## Inference (single image)
 
@@ -179,4 +185,10 @@ Video Diffusion weights used as our starting point are subject to
 Stability AI's licence terms; see the
 [SVD model card](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid)
 for details.
+
+## Acknowledgements
+
+We thank the [VDM_EVFI](https://github.com/chinmay0301ucsd/VDM-EVFI-CT),
+[LEDiff](https://github.com/Hans1984/LEDiff), and
+[X2HDR](https://github.com/X2HDR/X2HDR) authors for their code releases.
 
