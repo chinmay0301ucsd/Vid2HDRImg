@@ -1,5 +1,10 @@
 # Training
 
+> **Note:** this training code is released as-is, matching the configuration
+> used for the released checkpoints. It hasn't received the same testing as
+> the inference path, so treat it as a reference implementation and expect
+> to do some debugging when adapting it to a new dataset or environment.
+
 The pipeline has two independent stages. Train them in order.
 
 There are two ways to launch training:
