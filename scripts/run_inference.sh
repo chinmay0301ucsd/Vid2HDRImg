@@ -32,6 +32,9 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
 WIDTH="${WIDTH:-512}"
 HEIGHT="${HEIGHT:-512}"
 PEAK_LUM="${PEAK_LUM:-4000}"
+# Must match the checkpoint's eval config (4) — the temporal VAE decoder mixes
+# frames within a chunk, so this changes the output, not just GPU memory use.
+DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-4}"
 
 if [ -z "$INPUT" ]; then
     cat <<'EOF' >&2
@@ -64,4 +67,5 @@ python scripts/inference.py \
     --width             "$WIDTH" \
     --height            "$HEIGHT" \
     --peak_lum          "$PEAK_LUM" \
+    --decode_chunk_size "$DECODE_CHUNK_SIZE" \
     "${@:3}"

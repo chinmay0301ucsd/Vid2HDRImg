@@ -34,6 +34,9 @@ Override any default by setting more env vars: e.g.
 
 ### Single-GPU example (direct)
 
+The flags below match the config that trained the released checkpoint
+(`svd_hdr_raw_pair_no_cfg_nolora/checkpoint-16000`) exactly:
+
 ```bash
 accelerate launch scripts/train_video_model.py \
     --pretrained_model_name_or_path stabilityai/stable-video-diffusion-img2vid \
@@ -41,14 +44,22 @@ accelerate launch scripts/train_video_model.py \
     --output_dir      output/stage1 \
     --valid_hdr_path  /path/to/validation.hdr \
     --num_frames 5 --width 512 --height 512 \
-    --learning_rate 1e-5 \
+    --learning_rate 5e-5 \
     --per_gpu_batch_size 1 \
-    --gradient_checkpointing \
-    --mixed_precision bf16 \
+    --gradient_accumulation_steps 8 \
+    --lr_warmup_steps 100 \
+    --mixed_precision no \
+    --seed 123 \
+    --conditioning_dropout_prob 0.0 \
     --max_train_steps 30000 \
     --validation_steps 1000 \
     --checkpointing_steps 1000
 ```
+
+> `--conditioning_dropout_prob 0.0` disables CFG training entirely — the
+> released checkpoint is a "no_cfg" model, matched by `inference.py`'s
+> `--max_guidance_scale 1.0` default. Raise it above 0.0 only if you intend to
+> train a CFG-capable model (and use `--max_guidance_scale > 1.0` at inference).
 
 ### Multi-GPU example
 
@@ -67,9 +78,13 @@ accelerate launch --num_processes 4 scripts/train_video_model.py \
     --train_data_path /path/to/hdr_dataset \
     --output_dir      output/stage1 \
     --num_frames 5 --width 512 --height 512 \
-    --learning_rate 1e-5 \
+    --learning_rate 5e-5 \
     --per_gpu_batch_size 1 \
-    --mixed_precision bf16 \
+    --gradient_accumulation_steps 8 \
+    --lr_warmup_steps 100 \
+    --mixed_precision no \
+    --seed 123 \
+    --conditioning_dropout_prob 0.0 \
     --max_train_steps 30000
 ```
 
@@ -80,9 +95,10 @@ accelerate launch --num_processes 4 scripts/train_video_model.py \
 | `--raw_pair_data_path` | Use real raw / GT-HDR pairs (`RawHDRPairDataset`) instead of the synthetic-bracket dataset; raw frame becomes the conditioning anchor. |
 | `--use_lora --lora_rank R` | LoRA-adapt the UNet attention layers (memory-efficient FT). |
 | `--gradient_checkpointing` | Re-compute activations to halve memory cost at ~30% speed cost. |
-| `--mixed_precision bf16\|fp16` | bf16 is the recommended default (numerically more stable than fp16). |
+| `--mixed_precision no\|bf16\|fp16` | The released checkpoint was trained with `no` (full fp32); bf16 is a faster but not bit-identical alternative. |
 | `--compile_unet` | Apply `torch.compile` to the UNet (use `--compile_backend aot_eager` if Inductor fails). |
-| `--seed 42` | Reproducibility. |
+| `--conditioning_dropout_prob` | CFG training dropout probability. **0.0 for the released "no_cfg" checkpoint** — its argparse default (0.1) is for training a CFG-capable model instead. |
+| `--seed 123` | Reproducibility — 123 matches the released checkpoint's training run. |
 
 Run `python scripts/train_video_model.py --help` for the full surface.
 
@@ -103,15 +119,18 @@ TRAIN_DATA_PATH=/path/to/hdr_dataset \
     bash scripts/run_train_fusion_net.sh
 ```
 
-Or directly:
+Or directly. The flags below match the config that trained the released
+fusion net exactly (`output_svd_hdr_fus_only_combined/checkpoint-25000`):
 
 ```bash
 accelerate launch scripts/train_fusion_net.py \
     --train_data_path /path/to/hdr_dataset \
     --output_dir      output/stage2 \
     --num_frames 5 --width 512 --height 512 \
-    --learning_rate 1e-4 \
-    --per_gpu_batch_size 4 \
+    --learning_rate 1e-5 \
+    --per_gpu_batch_size 16 \
+    --random_crop \
+    --seed 123 \
     --max_train_steps 25000 \
     --checkpointing_steps 1000
 ```
