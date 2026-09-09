@@ -128,6 +128,8 @@ def build_pipeline(args, device: torch.device) -> StableVideoDiffusionPipelineHD
             args.unet_path, subfolder="unet"
         ),
         torch_dtype=torch.float32,
+        variant="fp16",  # base VAE/image_encoder are shipped as fp16-variant weights;
+                         # matches the eval config the released checkpoint was validated on
     )
     pipeline.scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(device)
@@ -164,8 +166,11 @@ def main():
                     help="Diffusion sampler steps.")
     ap.add_argument("--width",  type=int, default=512, help="Inference width.")
     ap.add_argument("--height", type=int, default=512, help="Inference height.")
-    ap.add_argument("--decode_chunk_size", type=int, default=8,
-                    help="Frames decoded per VAE forward (lower = less GPU memory).")
+    ap.add_argument("--decode_chunk_size", type=int, default=4,
+                    help="Frames decoded per VAE forward (lower = less GPU memory). "
+                         "Must match the checkpoint's eval config (4) — the temporal VAE "
+                         "decoder mixes frames within a chunk, so changing this changes the "
+                         "output, not just memory use.")
     ap.add_argument("--motion_bucket_id", type=int, default=0)
     ap.add_argument("--fps", type=int, default=7)
     ap.add_argument("--noise_aug_strength", type=float, default=0.0)
