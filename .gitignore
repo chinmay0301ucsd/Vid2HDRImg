@@ -24,6 +24,7 @@ env/
 
 # Local model weights / outputs (use HuggingFace for releases)
 weights/
+runtime/
 checkpoints/
 output*/
 runs/
