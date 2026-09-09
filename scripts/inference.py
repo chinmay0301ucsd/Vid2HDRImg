@@ -183,8 +183,16 @@ def main():
                     help="Drop only CLIP embedding for the unconditional pass.")
 
     # Output scale
+    ap.add_argument("--rescale_max", type=float, default=32.0,
+                    help="If > 0, rescale the predicted HDR so its own max equals this value "
+                         "(matches the convention used to save the checkpoint's eval outputs, "
+                         "hdr_predicted/*.exr, for direct visual comparison). Set to 0 to use "
+                         "--peak_lum instead (a fixed physical-brightness assumption, since "
+                         "--rescale_max makes --peak_lum a no-op — scaling by a constant then "
+                         "renormalizing to a fixed max cancels the constant out).")
     ap.add_argument("--peak_lum", type=float, default=4000.0,
-                    help="Peak luminance (cd/m^2) to scale the predicted HDR to.")
+                    help="Peak luminance (cd/m^2) to scale the predicted HDR to. Ignored unless "
+                         "--rescale_max is set to 0.")
 
     # Misc
     ap.add_argument("--seed", type=int, default=42)
@@ -250,8 +258,13 @@ def main():
     pixel_values_lin = frames_01.unsqueeze(0).to(device).clamp(0, 1) ** 2.2
     with torch.no_grad():
         hdr_pred_01, _weights = fusion_net(pixel_values_lin)
-    hdr_rel = hdr_pred_01[0].float().cpu().permute(1, 2, 0).numpy()  # (H, W, 3) in [0,~1]
-    pred_hdr = np.maximum(hdr_rel * float(args.peak_lum), 0.0).astype(np.float32)
+    hdr_rel = np.maximum(hdr_pred_01[0].float().cpu().permute(1, 2, 0).numpy(), 0.0)  # (H, W, 3) in [0,~1]
+    if args.rescale_max > 0:
+        rel_max = float(hdr_rel.max())
+        pred_hdr = (hdr_rel * (args.rescale_max / rel_max) if rel_max > 1e-8 else hdr_rel)
+    else:
+        pred_hdr = hdr_rel * float(args.peak_lum)
+    pred_hdr = pred_hdr.astype(np.float32)
 
     # ── Save fused HDR ────────────────────────────────────────────────────────
     hdr_io.imwrite(out_path, pred_hdr)

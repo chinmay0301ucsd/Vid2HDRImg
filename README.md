@@ -174,7 +174,8 @@ Useful options:
 | `--num_frames` | 5 | Number of LDR frames in the synthesised bracket. |
 | `--num_inference_steps` | 50 | Diffusion sampler steps. |
 | `--width / --height` | 512 / 512 | Inference resolution. |
-| `--peak_lum` | 4000 | Peak luminance (cd/m²) the predicted HDR is scaled to. |
+| `--rescale_max` | 32 | Rescale the saved HDR so its own max equals this value — matches the checkpoint's eval-output convention (`hdr_predicted/*.exr`) for direct visual comparison. Set to 0 to use `--peak_lum` instead. |
+| `--peak_lum` | 4000 | Peak luminance (cd/m²) the predicted HDR is scaled to. **Ignored unless `--rescale_max 0`** — rescaling to a fixed max makes a fixed multiplicative constant a no-op. |
 | `--max_guidance_scale` | 1.0 | CFG max scale (1.0 = no guidance, recommended). |
 | `--decode_chunk_size` | 4 | Frames per VAE decode call. **Must match the checkpoint's eval config (4)** — the temporal VAE decoder mixes frames within a chunk, so this changes the output, not just memory use. |
 | `--device` | cuda | Use `cpu` for debugging without a GPU. |

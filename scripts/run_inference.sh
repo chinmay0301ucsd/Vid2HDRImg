@@ -31,6 +31,11 @@ NUM_FRAMES="${NUM_FRAMES:-5}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
 WIDTH="${WIDTH:-512}"
 HEIGHT="${HEIGHT:-512}"
+# Rescales the saved HDR so its own max equals this value — matches the
+# convention used for the checkpoint's eval outputs (hdr_predicted/*.exr), for
+# direct visual comparison. Set to 0 to use PEAK_LUM (a fixed physical-brightness
+# assumption) instead — RESCALE_MAX > 0 makes PEAK_LUM a no-op.
+RESCALE_MAX="${RESCALE_MAX:-32}"
 PEAK_LUM="${PEAK_LUM:-4000}"
 # Must match the checkpoint's eval config (4) — the temporal VAE decoder mixes
 # frames within a chunk, so this changes the output, not just GPU memory use.
@@ -66,6 +71,7 @@ python scripts/inference.py \
     --num_inference_steps "$NUM_INFERENCE_STEPS" \
     --width             "$WIDTH" \
     --height            "$HEIGHT" \
+    --rescale_max       "$RESCALE_MAX" \
     --peak_lum          "$PEAK_LUM" \
     --decode_chunk_size "$DECODE_CHUNK_SIZE" \
     "${@:3}"
