@@ -22,12 +22,20 @@ EXCLUDE_FILES="${EXCLUDE_FILES:-}"        # space-separated basenames to hold ou
 NUM_FRAMES="${NUM_FRAMES:-5}"
 WIDTH="${WIDTH:-512}"
 HEIGHT="${HEIGHT:-512}"
-LR="${LR:-1e-5}"
+# Defaults below match the config that trained the released checkpoint
+# (svd_hdr_raw_pair_no_cfg_nolora/checkpoint-16000) exactly.
+LR="${LR:-5e-5}"
 BSZ="${BSZ:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-100}"
 MAX_STEPS="${MAX_STEPS:-30000}"
 VALIDATION_STEPS="${VALIDATION_STEPS:-1000}"
 CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
-MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+MIXED_PRECISION="${MIXED_PRECISION:-no}"
+SEED="${SEED:-123}"
+# The released checkpoint is trained with CFG conditioning dropout OFF ("no_cfg")
+# — do not raise this above 0.0 unless you intend to train a CFG-capable model.
+CONDITIONING_DROPOUT_PROB="${CONDITIONING_DROPOUT_PROB:-0.0}"
 
 # Distributed training
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
@@ -49,9 +57,11 @@ Optional env vars (with defaults):
   VALID_HDR_PATH   (none)
   EXCLUDE_FILES    (none, space-separated basenames)
   NUM_FRAMES (5)   WIDTH (512)   HEIGHT (512)
-  LR (1e-5)        BSZ (1)       MAX_STEPS (30000)
+  LR (5e-5)        BSZ (1)       MAX_STEPS (30000)
+  GRADIENT_ACCUMULATION_STEPS (8)  LR_WARMUP_STEPS (100)
   VALIDATION_STEPS (1000)        CHECKPOINTING_STEPS (1000)
-  MIXED_PRECISION  (bf16)
+  MIXED_PRECISION  (no)          SEED (123)
+  CONDITIONING_DROPOUT_PROB (0.0) — 0.0 matches the released "no_cfg" checkpoint
   NUM_PROCESSES    (1)           — pass >1 to multi-GPU launch
   RAW_PAIR_DATA_PATH (none)      — activates RawHDRPairDataset
 
@@ -77,8 +87,11 @@ accelerate launch --num_processes "$NUM_PROCESSES" scripts/train_video_model.py 
     --height                 "$HEIGHT" \
     --learning_rate          "$LR" \
     --per_gpu_batch_size     "$BSZ" \
-    --gradient_checkpointing \
+    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+    --lr_warmup_steps        "$LR_WARMUP_STEPS" \
     --mixed_precision        "$MIXED_PRECISION" \
+    --seed                   "$SEED" \
+    --conditioning_dropout_prob "$CONDITIONING_DROPOUT_PROB" \
     --max_train_steps        "$MAX_STEPS" \
     --validation_steps       "$VALIDATION_STEPS" \
     --checkpointing_steps    "$CHECKPOINTING_STEPS" \
